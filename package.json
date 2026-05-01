@@ -6,13 +6,14 @@
   "author": "grctest",
   "description": "Electron Bitnet is a desktop client for Microsoft's Bitnet LLM AI Inference engine.",
   "license": "MIT",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "browser": {
     "app": "app/app.js"
   },
   "build": {
     "appId": "ElectronBitnet",
     "productName": "ElectronBitnet",
+    "executableName": "ElectronBitnet",
     "artifactName": "ElectronBitnet.${ext}",
     "asar": false,
     "npmRebuild": false,
@@ -31,6 +32,14 @@
       {
         "from": "./bin",
         "to": "bin"
+      },
+      {
+        "from": "../BitNet/models/BitNet-b1.58-2B-4T",
+        "to": "models/BitNet-b1.58-2B-4T"
+      },
+      {
+        "from": "./LOCAL_API.md",
+        "to": "app/LOCAL_API.md"
       }
     ],
     "directories": {
@@ -38,8 +47,12 @@
       "output": "dist"
     },
     "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "oneClick": true,
+      "runAfterFinish": true,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "include": "build/installer.nsh"
     },
     "win": {
       "target": "nsis"

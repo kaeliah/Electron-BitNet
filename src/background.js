@@ -3,11 +3,13 @@ import path from 'path';
 import os from 'os';
 import process from 'process';
 import fs from 'fs';
+import crypto from 'crypto';
+import http from 'http';
 import url from "url";
 import { readFile } from 'fs/promises';
 import mime from 'mime-types';
 
-import { app, BrowserWindow, Menu, Tray, ipcMain, shell, protocol, dialog } from "electron";
+import { app, BrowserWindow, Menu, Tray, ipcMain, shell, protocol, dialog, clipboard } from "electron";
 
 import { initApplicationMenu } from "./lib/applicationMenu.js";
 
@@ -16,6 +18,356 @@ let tray = null;
 let inferenceProcess = null;
 let benchmarkProcess = null;
 let perplexityProcess = null;
+let apiServerProcess = null;
+let apiProxyServer = null;
+let appLogPath = null;
+
+const LOCAL_API_DEFAULTS = {
+  host: '127.0.0.1',
+  port: 5272,
+  proxyPort: 5273,
+  modelAlias: 'bitnet-local',
+  ctxSize: 4096,
+  threads: Math.max(1, Math.min(8, os.cpus().length)),
+  nPredict: 1024,
+  temperature: 0.7,
+  autoStart: true,
+};
+
+function ensureAppLogPath() {
+  if (appLogPath) {
+    return appLogPath;
+  }
+
+  try {
+    const baseDir = app.isReady()
+      ? app.getPath('userData')
+      : path.join(os.tmpdir(), 'ElectronBitnet');
+    fs.mkdirSync(baseDir, { recursive: true });
+    appLogPath = path.join(baseDir, 'main.log');
+  } catch (error) {
+    appLogPath = path.join(os.tmpdir(), 'ElectronBitnet-main.log');
+  }
+
+  return appLogPath;
+}
+
+function logLine(level, message, details = "") {
+  const line = `[${new Date().toISOString()}] [${level}] ${message}${details ? ` ${details}` : ''}`;
+  if (level === 'ERROR') {
+    console.error(line);
+  } else {
+    console.log(line);
+  }
+
+  try {
+    fs.appendFileSync(ensureAppLogPath(), `${line}\n`, 'utf8');
+  } catch (error) {
+    // Avoid recursive logging if filesystem access is the problem.
+  }
+}
+
+logLine('INFO', 'Main process module loaded');
+
+function getLocalApiConfigPath() {
+  return path.join(app.getPath('userData'), 'local-api.json');
+}
+
+function getLocalApiBaseUrl(config) {
+  return `http://${config.host}:${config.port}`;
+}
+
+function readLocalApiConfig() {
+  const configPath = getLocalApiConfigPath();
+  if (!fs.existsSync(configPath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch (error) {
+    logLine('ERROR', 'Failed to parse local API config:', error.stack || error.message);
+    return null;
+  }
+}
+
+function writeLocalApiConfig(config) {
+  const configPath = getLocalApiConfigPath();
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+}
+
+function ensureLocalApiConfig() {
+  const existingConfig = readLocalApiConfig() || {};
+  const mergedConfig = {
+    ...LOCAL_API_DEFAULTS,
+    ...existingConfig,
+  };
+
+  if (!mergedConfig.apiKey) {
+    mergedConfig.apiKey = crypto.randomBytes(24).toString('hex');
+  }
+
+  writeLocalApiConfig(mergedConfig);
+  return mergedConfig;
+}
+
+function getLocalApiPublicConfig() {
+  const config = ensureLocalApiConfig();
+  return {
+    ...config,
+    baseUrl: getLocalApiBaseUrl(config),
+    proxyBaseUrl: `http://${config.host}:${config.proxyPort}`,
+    chatCompletionsUrl: `${getLocalApiBaseUrl(config)}/v1/chat/completions`,
+    proxyChatCompletionsUrl: `http://${config.host}:${config.proxyPort}/v1/chat/completions`,
+    modelsUrl: `${getLocalApiBaseUrl(config)}/v1/models`,
+    proxyModelsUrl: `http://${config.host}:${config.proxyPort}/v1/models`,
+    healthUrl: `${getLocalApiBaseUrl(config)}/health`,
+    proxyHealthUrl: `http://${config.host}:${config.proxyPort}/health`,
+    status: apiServerProcess ? 'starting_or_running' : 'stopped',
+  };
+}
+
+function writeCorsHeaders(response) {
+  response.setHeader('Access-Control-Allow-Origin', '*');
+  response.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  response.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  response.setHeader('Access-Control-Max-Age', '86400');
+}
+
+async function startLocalApiProxyServer() {
+  const config = ensureLocalApiConfig();
+  if (apiProxyServer) {
+    return getLocalApiPublicConfig();
+  }
+
+  apiProxyServer = http.createServer(async (request, response) => {
+    writeCorsHeaders(response);
+
+    if (request.method === 'OPTIONS') {
+      response.writeHead(204);
+      response.end();
+      return;
+    }
+
+    const requestUrl = request.url || '/';
+    const allowedPaths = new Set([
+      '/health',
+      '/v1/models',
+      '/v1/chat/completions',
+    ]);
+
+    const parsedUrl = new URL(requestUrl, `http://${config.host}:${config.proxyPort}`);
+    if (!allowedPaths.has(parsedUrl.pathname)) {
+      response.writeHead(404, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ error: 'Not found' }));
+      return;
+    }
+
+    try {
+      const bodyChunks = [];
+      for await (const chunk of request) {
+        bodyChunks.push(chunk);
+      }
+
+      const rawBody = bodyChunks.length > 0 ? Buffer.concat(bodyChunks) : undefined;
+      const upstreamUrl = `${getLocalApiBaseUrl(config)}${parsedUrl.pathname}${parsedUrl.search}`;
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: request.method,
+        headers: {
+          'Content-Type': request.headers['content-type'] || 'application/json',
+          'Authorization': `Bearer ${config.apiKey}`,
+        },
+        body: request.method === 'GET' ? undefined : rawBody,
+      });
+
+      response.writeHead(upstreamResponse.status, {
+        'Content-Type': upstreamResponse.headers.get('content-type') || 'application/json',
+      });
+
+      const arrayBuffer = await upstreamResponse.arrayBuffer();
+      response.end(Buffer.from(arrayBuffer));
+    } catch (error) {
+      console.error('Local API proxy error:', error);
+      response.writeHead(502, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({
+        error: 'Upstream request failed',
+        details: error.message,
+      }));
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    apiProxyServer.once('error', reject);
+    apiProxyServer.listen(config.proxyPort, config.host, () => {
+      apiProxyServer.off('error', reject);
+      resolve();
+    });
+  });
+
+  return getLocalApiPublicConfig();
+}
+
+function stopLocalApiProxyServer() {
+  if (!apiProxyServer) {
+    return false;
+  }
+
+  apiProxyServer.close();
+  apiProxyServer = null;
+  return true;
+}
+
+function getServerBinaryPath() {
+  const candidatePaths = [
+    path.join(app.getAppPath(), 'bin', 'Release', 'llama-server.exe'),
+    path.join(process.resourcesPath, 'bin', 'Release', 'llama-server.exe'),
+  ];
+
+  return candidatePaths.find((candidate) => fs.existsSync(candidate)) || "";
+}
+
+async function waitForLocalApiReady(config, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  const targets = [
+    `${getLocalApiBaseUrl(config)}/health`,
+    `${getLocalApiBaseUrl(config)}/v1/models`,
+  ];
+
+  while (Date.now() < deadline) {
+    for (const target of targets) {
+      try {
+        const response = await fetch(target, {
+          headers: {
+            Authorization: `Bearer ${config.apiKey}`,
+          },
+        });
+
+        if (response.ok) {
+          return true;
+        }
+      } catch (error) {
+        // Server may still be starting.
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 750));
+  }
+
+  return false;
+}
+
+async function startLocalApiServer() {
+  const config = ensureLocalApiConfig();
+  const modelPath = getBundledModelPath();
+  const serverPath = getServerBinaryPath();
+
+  if (!modelPath) {
+    throw new Error('Bundled model not found for local API server.');
+  }
+
+  if (!serverPath) {
+    throw new Error('llama-server.exe not found.');
+  }
+
+  if (apiServerProcess) {
+    return getLocalApiPublicConfig();
+  }
+
+  const commandArgs = [
+    '-m', modelPath,
+    '--host', config.host,
+    '--port', String(config.port),
+    '-c', String(config.ctxSize),
+    '-t', String(config.threads),
+    '-n', String(config.nPredict),
+    '--temp', String(config.temperature),
+    '--api-key', config.apiKey,
+    '--alias', config.modelAlias,
+    '--metrics',
+    '--slots',
+    '-cb',
+    '-ngl', '0',
+  ];
+
+  apiServerProcess = spawn(serverPath, commandArgs, {
+    windowsHide: true,
+  });
+
+  apiServerProcess.stdout.on('data', (data) => {
+    logLine('INFO', '[local-api]', data.toString().trim());
+  });
+
+  apiServerProcess.stderr.on('data', (data) => {
+    logLine('ERROR', '[local-api]', data.toString().trim());
+  });
+
+  apiServerProcess.on('close', (code) => {
+    logLine('INFO', `Local API server exited with code ${code}`);
+    apiServerProcess = null;
+  });
+
+  apiServerProcess.on('error', (error) => {
+    logLine('ERROR', 'Local API server failed to start:', error.stack || error.message);
+    apiServerProcess = null;
+  });
+
+  const ready = await waitForLocalApiReady(config);
+  if (!ready) {
+    const pid = apiServerProcess?.pid;
+    if (apiServerProcess) {
+      apiServerProcess.kill('SIGKILL');
+      apiServerProcess = null;
+    }
+    throw new Error(`Local API server did not become ready in time${pid ? ` (PID ${pid})` : ''}.`);
+  }
+
+  await startLocalApiProxyServer();
+
+  return getLocalApiPublicConfig();
+}
+
+function stopLocalApiServer() {
+  stopLocalApiProxyServer();
+  if (!apiServerProcess) {
+    return false;
+  }
+
+  try {
+    apiServerProcess.kill('SIGKILL');
+  } catch (error) {
+    console.error('Failed to stop local API server:', error);
+  } finally {
+    apiServerProcess = null;
+  }
+
+  return true;
+}
+
+function regenerateLocalApiKey() {
+  const config = ensureLocalApiConfig();
+  config.apiKey = crypto.randomBytes(24).toString('hex');
+  writeLocalApiConfig(config);
+  return config;
+}
+
+function getBundledModelPath() {
+  const candidatePaths = [];
+
+  if (app.isPackaged) {
+    candidatePaths.push(
+      path.join(process.resourcesPath, 'models', 'BitNet-b1.58-2B-4T', 'ggml-model-i2_s.gguf'),
+      path.join(process.resourcesPath, 'app', 'models', 'BitNet-b1.58-2B-4T', 'ggml-model-i2_s.gguf')
+    );
+  } else {
+    candidatePaths.push(
+      path.join(app.getAppPath(), '..', 'BitNet', 'models', 'BitNet-b1.58-2B-4T', 'ggml-model-i2_s.gguf'),
+      path.join(app.getAppPath(), 'models', 'BitNet-b1.58-2B-4T', 'ggml-model-i2_s.gguf')
+    );
+  }
+
+  return candidatePaths.find((candidate) => fs.existsSync(candidate)) || "";
+}
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -251,6 +603,7 @@ function initInstructInference(args) {
 }
 
 const createWindow = async () => {
+  logLine('INFO', 'Creating main window');
   mainWindow = new BrowserWindow({
     minWidth: 480,
     minHeight: 695,
@@ -267,8 +620,22 @@ const createWindow = async () => {
   });
 
   initApplicationMenu(mainWindow);
+  ensureLocalApiConfig();
 
   mainWindow.loadURL('file://index.html');
+
+  mainWindow.on('closed', () => {
+    logLine('INFO', 'Main window closed');
+    mainWindow = null;
+  });
+
+  mainWindow.webContents.on('render-process-gone', (event, details) => {
+    logLine('ERROR', 'Renderer process gone:', JSON.stringify(details));
+  });
+
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+    logLine('ERROR', 'Window failed to load:', `${errorCode} ${errorDescription} ${validatedURL}`);
+  });
 
   mainWindow.webContents.setWindowOpenHandler(() => {
     return { action: "deny" };
@@ -285,6 +652,7 @@ const createWindow = async () => {
     {
       label: "Quit",
       click: function () {
+        logLine('INFO', 'Quit requested from tray menu');
         tray = null;
         app.quit();
       },
@@ -372,6 +740,53 @@ const createWindow = async () => {
     return os.cpus().length;
   });
 
+  ipcMain.handle('getBundledModelPath', async () => {
+    return getBundledModelPath();
+  });
+
+  ipcMain.handle('getLocalApiConfig', async () => {
+    return getLocalApiPublicConfig();
+  });
+
+  ipcMain.handle('startLocalApiServer', async () => {
+    return startLocalApiServer();
+  });
+
+  ipcMain.handle('stopLocalApiServer', async () => {
+    stopLocalApiServer();
+    return getLocalApiPublicConfig();
+  });
+
+  ipcMain.handle('regenerateLocalApiKey', async () => {
+    const config = regenerateLocalApiKey();
+    if (apiServerProcess) {
+      stopLocalApiServer();
+      await startLocalApiServer();
+    }
+    return {
+      ...config,
+      baseUrl: getLocalApiBaseUrl(config),
+      proxyBaseUrl: `http://${config.host}:${config.proxyPort}`,
+      chatCompletionsUrl: `${getLocalApiBaseUrl(config)}/v1/chat/completions`,
+      proxyChatCompletionsUrl: `http://${config.host}:${config.proxyPort}/v1/chat/completions`,
+      modelsUrl: `${getLocalApiBaseUrl(config)}/v1/models`,
+      proxyModelsUrl: `http://${config.host}:${config.proxyPort}/v1/models`,
+      healthUrl: `${getLocalApiBaseUrl(config)}/health`,
+      proxyHealthUrl: `http://${config.host}:${config.proxyPort}/health`,
+      status: apiServerProcess ? 'starting_or_running' : 'stopped',
+    };
+  });
+
+  ipcMain.on("copyLocalApiEndpoint", () => {
+    const config = ensureLocalApiConfig();
+    clipboard.writeText(`${getLocalApiBaseUrl(config)}/v1/chat/completions`);
+  });
+
+  ipcMain.on("copyLocalApiKey", () => {
+    const config = ensureLocalApiConfig();
+    clipboard.writeText(config.apiKey);
+  });
+
   ipcMain.on("runBenchmark", (event, arg) => {
     runBenchmark(arg);
   });
@@ -401,7 +816,22 @@ const createWindow = async () => {
     mainWindow?.focus();
     mainWindow?.setAlwaysOnTop(false);
   });
+
+  const localApiConfig = ensureLocalApiConfig();
+  if (localApiConfig.autoStart) {
+    startLocalApiServer().catch((error) => {
+      logLine('ERROR', 'Failed to auto-start local API server:', error.stack || error.message);
+    });
+  }
 };
+
+process.on('uncaughtException', (error) => {
+  logLine('ERROR', 'Uncaught exception:', error.stack || error.message);
+});
+
+process.on('unhandledRejection', (reason) => {
+  logLine('ERROR', 'Unhandled rejection:', reason?.stack || `${reason}`);
+});
 
 const currentOS = os.platform();
 if (currentOS === "win32" || currentOS === "linux") {
@@ -409,11 +839,29 @@ if (currentOS === "win32" || currentOS === "linux") {
   const gotTheLock = app.requestSingleInstanceLock();
 
   if (!gotTheLock) {
+    logLine('INFO', 'Single instance lock not acquired, quitting');
     app.quit();
+  } else {
+    logLine('INFO', 'Single instance lock acquired');
+    app.on('second-instance', () => {
+      if (!mainWindow) {
+        createWindow();
+        return;
+      }
+
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+
+      mainWindow.show();
+      mainWindow.focus();
+    });
   }
 
   app.whenReady()
     .then(() => {
+      app.setAppUserModelId('ElectronBitnet');
+      logLine('INFO', 'App ready on Windows/Linux');
       protocol.handle('file', async (req) => {
         const { pathname } = new URL(req.url);
         if (!pathname) {
@@ -436,7 +884,7 @@ if (currentOS === "win32" || currentOS === "linux") {
         try {
           _res = await readFile(fullPath);
         } catch (error) {
-          console.log({ error });
+          logLine('ERROR', 'Failed to read requested file asset:', error.stack || error.message);
         }
 
         const mimeType = mime.lookup(fullPath) || 'application/octet-stream';
@@ -447,6 +895,35 @@ if (currentOS === "win32" || currentOS === "linux") {
       });
     })
     .then(createWindow);
+
+  app.on('before-quit', () => {
+    logLine('INFO', 'before-quit received');
+    terminateInference();
+    terminateBenchmark();
+    terminatePerplexity();
+    stopLocalApiServer();
+  });
+
+  app.on('will-quit', () => {
+    logLine('INFO', 'will-quit received');
+    terminateInference();
+    terminateBenchmark();
+    terminatePerplexity();
+    stopLocalApiServer();
+  });
+
+  app.on("window-all-closed", () => {
+    logLine('INFO', 'window-all-closed received');
+    if (process.platform !== "darwin") {
+      app.quit();
+    }
+  });
+
+  app.on("activate", () => {
+    if (mainWindow === null) {
+      createWindow();
+    }
+  });
 } else {
   app.whenReady().then(() => {
     protocol.handle('file', async (req) => {
@@ -486,12 +963,14 @@ if (currentOS === "win32" || currentOS === "linux") {
     terminateInference();
     terminateBenchmark();
     terminatePerplexity();
+    stopLocalApiServer();
   });
   
   app.on('will-quit', (event) => {
     terminateInference();
     terminateBenchmark();
     terminatePerplexity();
+    stopLocalApiServer();
   });
 
   app.on("window-all-closed", () => {

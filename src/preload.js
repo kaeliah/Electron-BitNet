@@ -5,6 +5,13 @@ contextBridge.exposeInMainWorld("electron", {
   openURL: async (target) => ipcRenderer.send("openURL", target),
   openFileDialog: async () => ipcRenderer.invoke("openFileDialog"),
   getMaxThreads: async () => ipcRenderer.invoke("getMaxThreads"),
+  getBundledModelPath: async () => ipcRenderer.invoke("getBundledModelPath"),
+  getLocalApiConfig: async () => ipcRenderer.invoke("getLocalApiConfig"),
+  startLocalApiServer: async () => ipcRenderer.invoke("startLocalApiServer"),
+  stopLocalApiServer: async () => ipcRenderer.invoke("stopLocalApiServer"),
+  regenerateLocalApiKey: async () => ipcRenderer.invoke("regenerateLocalApiKey"),
+  copyLocalApiEndpoint: async () => ipcRenderer.send("copyLocalApiEndpoint"),
+  copyLocalApiKey: async () => ipcRenderer.send("copyLocalApiKey"),
 
   // --- Standard Inference (Non-Interactive) ---
   runInference: async (args) => ipcRenderer.send("runInference", args),

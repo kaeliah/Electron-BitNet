@@ -64,6 +64,19 @@ export default function PerplexityUI(properties) {
         getMaxThreads();
     }, []);
 
+    useEffect(() => {
+        if (!window.electron) {
+            return;
+        }
+        async function loadBundledModel() {
+            const bundledModelPath = await window.electron.getBundledModelPath();
+            if (bundledModelPath) {
+                setModel(bundledModelPath);
+            }
+        }
+        loadBundledModel();
+    }, []);
+
     const handleFileSelect = async () => {
         const filePaths = await window.electron.openFileDialog();
         if (filePaths.length > 0) {

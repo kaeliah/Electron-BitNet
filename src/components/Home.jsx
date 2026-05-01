@@ -331,6 +331,17 @@ export default function InstructionModel(properties) {
     }, []);
 
     useEffect(() => {
+        if (!window.electron) return;
+        async function loadBundledModel() {
+            const bundledModelPath = await window.electron.getBundledModelPath();
+            if (bundledModelPath) {
+                setModel(bundledModelPath);
+            }
+        }
+        loadBundledModel();
+    }, []);
+
+    useEffect(() => {
         if (!autoScroll || !chatListRef.current || chatHistory.length === 0) return;
         chatListRef.current.scrollToRow({ index: chatHistory.length - 1, align: 'end' });
     }, [chatHistory, autoScroll]);
